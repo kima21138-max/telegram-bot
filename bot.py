@@ -1,0 +1,322 @@
+# -*- coding: utf-8 -*-
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from datetime import datetime, timedelta
+import json, os, io, re
+import matplotlib.pyplot as plt
+
+import os
+TOKEN = os.getenv("TOKEN")
+FILE = "diary.json"
+
+WELCOME_TEXT = """📔 Мои заметки
+
+Пиши текст, добавляй #теги
+Можно выбрать тему и писать как отдельный поток
+
+Меню внизу 👇
+"""
+
+# --- МЕНЮ ---
+def main_menu():
+    return ReplyKeyboardMarkup(
+        [
+            ["➕ Тема", "📂 Темы"],
+            ["🔎 Поиск", "📅 За неделю"],
+            ["📊 График", "📈 Статистика"],
+            ["✏️ Изменить тему", "🗑 Удалить тему"]
+        ],
+        resize_keyboard=True
+    )
+
+# --- ДАННЫЕ ---
+def load_data(user_id):
+    if os.path.exists(FILE):
+        with open(FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data.get(str(user_id), {})
+    return {}
+
+def save_data(user_id, user_data):
+    all_data = {}
+    if os.path.exists(FILE):
+        with open(FILE, "r", encoding="utf-8") as f:
+            all_data = json.load(f)
+
+    all_data[str(user_id)] = user_data
+
+    with open(FILE, "w", encoding="utf-8") as f:
+        json.dump(all_data, f, ensure_ascii=False, indent=2)
+
+# --- УТИЛИТЫ ---
+def get_tags(text):
+    return re.findall(r"#\w+", text.lower())
+
+def get_mood(text):
+    if any(e in text for e in ["😔","😢","😭","😞"]): return 1
+    if any(e in text for e in ["😐","😑"]): return 2
+    if any(e in text for e in ["😊","😄","😍","🙂"]): return 3
+    return None
+
+def suggest_tag(text, existing_tags):
+    words = text.lower().split()
+    for word in words:
+        for tag in existing_tags:
+            if word in tag:
+                return tag
+    return None
+
+def suggest_keyboard(tag):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Добавить", callback_data=f"addtag:{tag}"),
+            InlineKeyboardButton("Пропустить", callback_data="skiptag")
+        ]
+    ])
+
+# --- СТАРТ ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(WELCOME_TEXT, reply_markup=main_menu())
+
+# --- КНОПКИ (автотег) ---
+async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    data = load_data(user_id)
+    text = context.user_data.get("pending_text", "")
+
+    date = datetime.now().strftime("%Y-%m-%d")
+    data.setdefault(date, [])
+
+    tags = get_tags(text)
+
+    if query.data.startswith("addtag:"):
+        tag = query.data.split(":")[1]
+        tags.append(tag)
+
+    if context.user_data.get("current_topic"):
+        tags.append(context.user_data["current_topic"])
+
+    entry = {
+        "text": text,
+        "tags": list(set(tags)),
+        "mood": get_mood(text)
+    }
+
+    data[date].append(entry)
+    save_data(user_id, data)
+
+    context.user_data.clear()
+    await query.message.reply_text("Сохранено 📌", reply_markup=main_menu())
+
+# --- ОСНОВНАЯ ЛОГИКА ---
+async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    text = update.message.text or ""
+    user_id = update.message.from_user.id
+    data = load_data(user_id)
+
+    # --- СОЗДАНИЕ ТЕМЫ ---
+    if context.user_data.get("mode") == "create_topic":
+        topic = "#" + text.lower()
+        data.setdefault("topics", [])
+
+        if topic not in data["topics"]:
+            data["topics"].append(topic)
+
+        context.user_data["current_topic"] = topic
+        context.user_data["mode"] = None
+
+        save_data(user_id, data)
+        await update.message.reply_text(f"Тема создана: {topic}", reply_markup=main_menu())
+        return
+
+    # --- ВЫБОР ТЕМЫ ---
+    if context.user_data.get("mode") == "choose_topic":
+        context.user_data["current_topic"] = text
+        context.user_data["mode"] = None
+        await update.message.reply_text(f"Выбрана тема: {text}", reply_markup=main_menu())
+        return
+
+    # --- РЕДАКТИРОВАНИЕ ТЕМЫ ---
+    if context.user_data.get("mode") == "edit_select":
+        context.user_data["old_tag"] = text
+        context.user_data["mode"] = "edit_new"
+        await update.message.reply_text("Введи новое название:")
+        return
+
+    if context.user_data.get("mode") == "edit_new":
+        old_tag = context.user_data["old_tag"]
+        new_tag = "#" + text.lower()
+
+        data["topics"] = [new_tag if t == old_tag else t for t in data.get("topics", [])]
+
+        for day in data:
+            if day == "topics": continue
+            for e in data[day]:
+                if old_tag in e.get("tags", []):
+                    e["tags"] = [new_tag if t == old_tag else t for t in e["tags"]]
+
+        save_data(user_id, data)
+        context.user_data.clear()
+        await update.message.reply_text(f"{old_tag} → {new_tag}", reply_markup=main_menu())
+        return
+
+    # --- УДАЛЕНИЕ ТЕМЫ ---
+    if context.user_data.get("mode") == "delete_select":
+        tag = text
+
+        if tag in data.get("topics", []):
+            data["topics"].remove(tag)
+
+        for day in data:
+            if day == "topics": continue
+            for e in data[day]:
+                if tag in e.get("tags", []):
+                    e["tags"].remove(tag)
+
+        save_data(user_id, data)
+        context.user_data.clear()
+        await update.message.reply_text(f"Удалена: {tag}", reply_markup=main_menu())
+        return
+
+    # --- ПОИСК ---
+    if context.user_data.get("mode") == "search":
+        keyword = text if text.startswith("#") else "#" + text.lower()
+
+        results = []
+        for day, entries in data.items():
+            if day == "topics": continue
+            for e in entries:
+                if keyword in e.get("tags", []):
+                    results.append(f"{day}: {e.get('text','')}")
+
+        await update.message.reply_text("\n".join(results) if results else "Ничего не найдено", reply_markup=main_menu())
+        context.user_data["mode"] = None
+        return
+
+    # --- КНОПКИ ---
+    if text == "➕ Тема":
+        context.user_data["mode"] = "create_topic"
+        await update.message.reply_text("Напиши название темы:")
+        return
+
+    if text == "📂 Темы":
+        topics = data.get("topics", [])
+        if not topics:
+            await update.message.reply_text("Тем пока нет")
+            return
+        keyboard = [[t] for t in topics]
+        await update.message.reply_text("Выбери тему:", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+        context.user_data["mode"] = "choose_topic"
+        return
+
+    if text == "✏️ Изменить тему":
+        topics = data.get("topics", [])
+        if not topics:
+            await update.message.reply_text("Тем нет")
+            return
+        keyboard = [[t] for t in topics]
+        await update.message.reply_text("Какую изменить?", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+        context.user_data["mode"] = "edit_select"
+        return
+
+    if text == "🗑 Удалить тему":
+        topics = data.get("topics", [])
+        if not topics:
+            await update.message.reply_text("Тем нет")
+            return
+        keyboard = [[t] for t in topics]
+        await update.message.reply_text("Какую удалить?", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+        context.user_data["mode"] = "delete_select"
+        return
+
+    if text == "🔎 Поиск":
+        context.user_data["mode"] = "search"
+        await update.message.reply_text("Введи #тег:")
+        retun
+
+    # --- ЗА НЕДЕЛЮ ---
+    if text == "📅 За неделю":
+        week = datetime.now() - timedelta(days=7)
+        results = []
+
+        for d, entries in data.items():
+            if d == "topics":
+                continue
+            if datetime.strptime(d, "%Y-%m-%d") >= week:
+                for e in entries:
+                    results.append(f"{d}: {e.get('text','')}")
+
+        await update.message.reply_text(
+            "\n".join(results) if results else "Нет записей",
+            reply_markup=main_menu()
+        )
+        return
+
+
+    # --- СТАТИСТИКА ---
+    if text == "📈 Статистика":
+        total = 0
+        tag_count = {}
+
+        for day, entries in data.items():
+            if day == "topics":
+                continue
+            total += len(entries)
+
+            for e in entries:
+                for t in e.get("tags", []):
+                    tag_count[t] = tag_count.get(t, 0) + 1
+
+        msg = f"Всего записей: {total}\n\n"
+
+        for k, v in sorted(tag_count.items(), key=lambda x: x[1], reverse=True):
+            msg += f"{k}: {v}\n"
+
+        await update.message.reply_text(msg, reply_markup=main_menu())
+        return
+
+
+    # --- ГРАФИК ---
+    if text == "📊 График":
+        if not data:
+            await update.message.reply_text("Нет данных", reply_markup=main_menu())
+            return
+
+        x, y = [], []
+
+        for d in sorted(data.keys()):
+            if d == "topics":
+                continue
+
+            moods = [e["mood"] for e in data[d] if e.get("mood")]
+
+            y.append(sum(moods)/len(moods) if moods else 2)
+            x.append(d)
+
+        plt.figure()
+        plt.plot(x, y, marker='o')
+        plt.xticks(rotation=45)
+        plt.yticks([1,2,3], ["😔","😐","😊"])
+
+        buf = io.BytesIO()
+        plt.savefig(buf)
+        buf.seek(0)
+        plt.close()
+
+        await update.message.reply_photo(buf)
+        return
+
+# --- ЗАПУСК ---
+app = ApplicationBuilder().token(TOKEN).build()
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CallbackQueryHandler(handle_buttons))
+app.add_handler(MessageHandler(filters.TEXT, handle))
+
+print("БОТ ЗАПУЩЕН")
+app.run_polling()
